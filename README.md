@@ -21,7 +21,7 @@ githubの以下のリンクがコードです。
 
 https://github.com/abetlen/llama-cpp-python
 
-### #インストール
+### インストール
 
 miniconda環境でインストール
 
