@@ -1,5 +1,7 @@
 # 自分で作るAIキャラ　第1部ローカルLLM編
 ## 第2章
+
+環境構築
 ```
 sudo apt install git
 sudo apt install -y python3.11 python3.11-venv
