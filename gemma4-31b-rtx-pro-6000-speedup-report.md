@@ -400,6 +400,8 @@ MTP: vLLM は c=1 で 1.5〜1.6 倍、c=16 で 1.85〜2.3 倍。**llama-server �
 - キャラクターチャットの報告（X・note、逸話レベル）: 26B-A4B は「人格の深みが表面的」「設定や関係性を取りこぼす」「一人称・二人称が入れ替わる」「長いシステムプロンプトで thinking を飛ばす」「突然キャラを崩して拒否する」。31B は長文脈でも人格を保つ。この用途では **31B との差が最も出やすい領域**。
 - 量子化感度が高い: LocalBench では Q8_0 でも KL 0.544（31B は 0.163）、KV q8_0 で KL 0.377、q4_0 KV で 1.088。Unsloth: QAT を素朴に Q4_0 化すると top-1 一致 70.2%（UD-Q4_K_XL は 85.6%）。vLLM 公式レシピは「エキスパートが小さく 4bit で品質が落ちすぎる」として 26B-A4B を W4A16 QAT の対象から外し、`int8_per_channel_weight_only` を勧める。→ **26B-A4B なら Q8_0／FP8／INT8 を選ぶのが筋**（単一ストリームは起動律速なので速度はほぼ変わらず、PRO 5000 でも容量は足りる）。KV は f16 のまま。
 - サンプラ: コミュニティ推奨は repetition penalty 無効（1.0）、Google 既定 temp 1.0／top-p 0.95／top-k 64。
+- **ツール呼び出しの正確さ**: 著者自身の過去の比較で 31B と 26B-A4B に明確な差があった（31B 優位）。公式ベンチでも Tau2（エージェント的ツール使用）は 68.2 対 76.9 と、長文脈に次いで差が大きい項目。アプリがツール呼び出しを前提にするなら、26B への切り替えはツール呼び出しを含まないキャラ・経路に限るか、ツール呼び出しターンだけ 31B に回す構成にする。
+- ツール呼び出しと高速化の相互作用: llama.cpp では grammar／JSON schema 制約を使うと `-bs`（GPU サンプリング）が無効になり CPU サンプリングに戻る。投機的デコードは制約付き生成で受理率が落ちる（vLLM＋xgrammar で EAGLE-3 K=5 の受理が 1.44 トークン/提案の報告）。vLLM は `--tool-call-parser gemma4`（専用トークン `<|tool_call>` を解釈）が必要。ツール呼び出しターンは短く構造的なので、MTP より ngram 系の方が効く可能性があるが未計測。
 
 ### B.6 運用メモ
 - vLLM: `vllm serve <FP8 または NVFP4 チェックポイント> --max-model-len 32768 --max-num-seqs 16 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --async-scheduling --limit-mm-per-prompt '{"image":0,"audio":0}' --speculative-config '{"model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'`。TP=1、`--enable-expert-parallel` は不要。SM120 の MoE バックエンドは版で変わる（Marlin／CUTLASS／b12x、`--moe-backend` で指定、起動ログで確認。v0.21 → v0.23 で退行例あり）。
