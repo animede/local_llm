@@ -316,6 +316,37 @@ ncu --kernel-name-base demangled --kernel-name "regex:flash_attn_ext_f16<512" --
 
 ---
 
+## 付録 A. RTX PRO 5000 Blackwell の場合（改造以外の選択がどう変わるか）
+
+RTX PRO 5000 Blackwell: 48 GB GDDR7 ECC（384-bit、**1,344 GB/s**）、14,080 CUDA コア（**110 SM**）、300 W、同じ SM120（CC 12.0）。72 GB 版（同じ帯域・コア数）が Puget Systems の製品一覧にある【未確認（単一出典）】。PRO 6000 比で帯域 0.75 倍、SM 数 0.585 倍、メモリ 0.5 倍（72 GB 版なら 0.75 倍）。Gemma 4 31B での公開実測は見つからなかったので、以下はすべて比例計算【推定】。
+
+### A.1 何が変わらないか
+- カーネル対応表（§2）はすべて同じ。SM120 の制約、vLLM の `--attention-backend FLASHINFER` 明示、llama.cpp の 3 つの問題（§3.1）、`-bs`、MTP、量子化 KV の f16 変換、`--cache-reuse` 無効、prefill が他スロットを止める点は全部そのまま当てはまる。
+
+### A.2 何が変わるか
+| 項目 | PRO 6000 | PRO 5000 48 GB | 影響 |
+|---|---|---|---|
+| 4bit 単一ストリーム上限 | 104 tok/s（現実 60 前後） | **78 tok/s（現実 45 前後）** | 帯域比 0.75 |
+| Q8_0/FP8 重み | 55 tok/s、同時 20 系列以上 | 41 tok/s、**残り約 10 GiB で 8K が 5 系列** | 実質 4bit 一択。BF16 は不可 |
+| prefill（TTFT） | Q4 で約 3,700 tok/s | 約 2,200 tok/s | SM 比 0.585。2K ペルソナの初回で 1 秒前後 |
+| 検証バッチの計算の崖（4bit） | 30〜40 行 | **25〜30 行** | 投機の K を早く絞る: 同時 4 で K=2、8 で K=1、12 以上は切る |
+| llama.cpp f16 KV の同時数（8K、`-ub 512`） | 約 40 | **約 14**（`-ub 256` で 16、16K で 10、32K で 7） | スロット数の上限がメモリで決まる |
+| vLLM W4A16 ＋ FP8 KV（8K） | 約 85 | **約 33**（bf16 KV なら 16） | FP8 KV が「任意」から「必須」に |
+| DFlash/DSpark ドラフタ（BF16 4〜5 GB） | 余裕 | 8K 系列 3 本分の KV を食う | MTP（0.5 GB）の方が合理的 |
+| 合計スループット（8K、現実係数 0.65）| llama.cpp 16 並列 約 380、vLLM FP8 KV 約 580 | llama.cpp 14 並列で頭打ち **約 270**、vLLM FP8 KV 16 並列 **約 435** | 多人数では vLLM の優位が大きくなる |
+| 300 W の電力枠 | 600 W（500 W でほぼ同等） | 固定 | 多人数の MMQ 計算・prefill で頭打ちになりやすい |
+
+72 GB 版なら容量側は PRO 6000 の 7 割まで戻る（llama.cpp f16 KV で 8K 約 27 スロット、vLLM FP8 KV で約 66 系列）。帯域と SM 数は変わらないので単一ストリーム・prefill は 48 GB 版と同じ。
+
+### A.3 改造以外でできる選択（優先順）
+1. **同時数の目標で先に判断する。** 8K コンテキストで同時 8 人までなら llama.cpp（QAT Q4_0 ＋ MTP K=1〜2 ＋ `-bs` ＋ `-ub 256` ＋ `-c` を 8〜16K/スロットに制限）で足りる。同時 12 人以上、または 16K 以上の履歴を抱えるなら、FP8 KV で容量と KV 読み出しが半分になる vLLM（`--kv-cache-dtype fp8`、`--max-num-seqs 16〜24`、`--max-model-len 16384`）に切り替える価値が PRO 6000 より大きい。
+2. **モデルサイズの選択が最大のレバーになる。** 31B は 4bit でも 17.3 GB/トークンで、この帯域では 45 tok/s 前後が現実値。`gemma-4-26B-A4B-it`（MoE、活性 3.8B、4bit 約 15 GB、1 ステップの重み読み出し 3〜10 GB）は単一 3 倍前後・同時 8 で 1 ステップ 7.5 GB → 合計の天井が 31B の 4 倍、しかも MoE は MTP の利得がバッチで増える。`gemma-4-12B-it`（4bit 6.8 GB → 上限 199 tok/s）も候補。キャラチャットでの品質差は §8 の日本語ハーネスとペア比較で確かめる。
+3. **アイドルセッションはホスト RAM へ**（llama.cpp `--cache-ram 32768〜65536` ＋ `--cache-idle-slots`、vLLM は `kv_offloading_size`／LMCache）。48 GB では「常駐させるペルソナの数」が直接スループットを削るので、PCIe 5 の 40〜80 ms の復元コストを払ってでも退避する。
+4. **KV を伸ばさない運用**: 履歴の要約・切り詰めで 1 系列 8K 以内に収める、ペルソナを 1〜1.5K に圧縮する、画像入力を切って視覚塔（1.1 GB）を載せない（llama.cpp は mmproj を付けない、vLLM は `--language-model-only`）。
+5. **カード 2 枚（96 GB 相当）**: vLLM の TP=2 は PCIe（NVLink なし）で層ごとの all-reduce が入り、単一ストリームは 1 枚とほぼ同じ〜やや遅い（帯域の合算は効くが同期で相殺）。容量と合計スループットは 2 倍近くまで伸びる。llama.cpp の分割（`--split-mode layer`）は容量だけ増えて速度は 1 枚分。単一ストリーム重視なら PRO 6000 1 枚、同時数重視なら PRO 5000 2 枚 ＋ vLLM という選び方になる。
+6. **投機の設定**: MTP ドラフタ（0.5 GB）は使う。K は同時 1〜2 で 3、4 で 2、8 で 1、12 以上で 0。DFlash/DSpark は VRAM と Triton 経路の点で後回し。
+7. **計測**: §9 の手順をそのまま使う。崖の位置（`llama-batched-bench -npl 1,2,4,5,6,8,9,12`）と FP8 KV の有無での同時 16 の TPOT（vLLM）を先に測る。
+
 ## 11. 主な参考 URL
 
 - Gemma 4 技術レポート: https://arxiv.org/abs/2607.02770 ／ vLLM 公式レシピ: https://docs.vllm.ai/projects/recipes/en/stable/Google/Gemma4.html ／ Google MTP ドラフタ: https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/
