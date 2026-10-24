@@ -347,6 +347,68 @@ RTX PRO 5000 Blackwell: 48 GB GDDR7 ECC（384-bit、**1,344 GB/s**）、14,080 C
 6. **投機の設定**: MTP ドラフタ（0.5 GB）は使う。K は同時 1〜2 で 3、4 で 2、8 で 1、12 以上で 0。DFlash/DSpark は VRAM と Triton 経路の点で後回し。
 7. **計測**: §9 の手順をそのまま使う。崖の位置（`llama-batched-bench -npl 1,2,4,5,6,8,9,12`）と FP8 KV の有無での同時 16 の TPOT（vLLM）を先に測る。
 
+## 付録 B. Gemma 4 26B-A4B（MoE）に切り替えた場合の見積もり
+
+### B.1 構成（HF config の引用スニペット、vLLM／llama.cpp のソースで確認）
+- 30 層 ＝ SWA（窓 1,024）25 層 ＋ グローバル 5 層（5:1）。hidden 2,816、16 ヘッド。ローカル KV 8 × 256、グローバル KV 2 × 512（K==V）。語彙 262,144（tied）。PLE なし。
+- 全 30 層が MoE: 128 エキスパート中 top-8（softmax → top-k → 再正規化）、エキスパート幅 704、**それと並列に幅 2,112 の密な MLP（共有エキスパート相当）**が毎層走る。
+- パラメータ（計算値、Google 公称 25.2B／3.8B と一致）: エキスパート 22.84B（1 個 5.95M、全体の 90%）、密 MLP 0.535B、アテンション 1.11B、埋め込み 0.738B → 合計 25.2B、**トークンあたり有効 3.82B**。
+- ファイル: Google QAT Q4_0 GGUF 14.4 GB（＋mmproj 1.19 GB）、Unsloth QAT UD-Q4_K_XL 14.2 GB、Q4_K_M 約 16.5 GB、NVFP4 約 16〜16.5 GB、Q8_0 約 28.4 GB、FP8 約 26〜29 GB【未確認】、BF16 50.4 GB。注意: エキスパートの down 行列は幅 704 で 256 の倍数でないため、K 量子化／IQ 量子化が使えず約 31% の重みが Q5_0/Q4_0/IQ4_NL に落ちる（「Q4_K_M」の実 bpw がアップローダごとに違う）。
+- MTP ドラフタ `google/gemma-4-26B-A4B-it-assistant`: 4 層（SWA 3 ＋ グローバル 1）、hidden 1,024、約 420M、BF16 839 MB。
+
+### B.2 1 ステップの読み出しバイト数（独立ルーティング仮定: 同時 c で使うユニークなエキスパート数 ＝ 128 × (1 − (1 − 8/128)^c)）
+| 同時数 c | ユニーク専門家/層 | 4.5 bpw（Q4_0/QAT） | FP8（head BF16） | 参考: 31B 4.5 bpw |
+|---|---|---|---|---|
+| 1 | 8.0 | 2.15 GB | 4.56 GB | 17.3 GB |
+| 4 | 29.1 | 4.27 GB | 8.33 GB | 17.3 GB |
+| 8 | 51.6 | 6.53 GB | 12.34 GB | 17.3 GB |
+| 16 | 82.4 | 9.62 GB | 17.84 GB | 17.3 GB |
+| 32 | 111.8 | 12.6 GB | 22.8 GB | 17.3 GB |
+
+- 投機（MTP）を使うと検証トークン数 c×(K+1) でユニーク数が増える（c=4・K=3 で 16 トークン → 82 個 → 9.6 GB）。そのため **MoE では低同時数ほど投機のコストが相対的に高く、同時数が増えるほど無料に近づく**（vLLM の実測で MTP の利得が bs1 の 1.60 倍 → bs64 の 2.27 倍に増える理由）。
+- KV（f16）: ローカル層 8 KiB/トークン/層 × 25 ＝ 200 KiB/トークン、窓 1,024 で 210 MB/系列（llama.cpp のリング 1,536 セルなら 300 MB）。グローバル層 4 KiB × 5 ＝ **20 KiB/トークン**（31B の 1/4）。32K で 0.82 GiB、128K で 2.7 GiB／系列。**16 ユーザー × 32K が f16 で 13.1 GiB**（31B は 52.5 GiB）。
+- 帯域だけの上限は PRO 6000 で c=1 834 tok/s、FP8 でも 393 tok/s。しかし実測はどのエンジンも 140〜270 tok/s で、**単一ストリームは帯域ではなく起動・レイテンシ律速**（llama.cpp は 1 ステップ約 1,250 カーネル）。したがって単一ストリームでは量子化を軽くしても速くならず、逆に **26B なら FP8／Q8_0 を選んでも単一ストリームの速度はほぼ変わらない**（多人数では効く）。
+
+### B.3 公開実測（RTX PRO 6000、2026 年）
+| 条件 | 単一ストリーム | 並列 | 出典 |
+|---|---|---|---|
+| llama.cpp Q4 | **196 tok/s（4K）**、170（32K）、133（128K）、pp 9,437 tok/s | 未計測 | hardware-corner |
+| Ollama Q4_K_M | 171〜181 | 4 並列で vLLM に劣る | allenkuo |
+| vLLM NVFP4（Marlin MoE）＋ MTP γ=4 | **169.2** | **2,237 tok/s @16 並列**（v0.21）、1,807（v0.23 CUTLASS） | vLLM issue #47047 |
+| vLLM NVFP4、投機なし | 160〜162 | 約 2,170 @32 | lna-lab、petronella |
+| vLLM FP8 | 139（1K）、77（256K）、TTFT 81 ms | 674 @10（1K）、334 @10（32K） | MillstoneAI |
+| RTX 5090 llama.cpp Q4 | 180〜249 | — | hardware-corner、Atomic Chat |
+| H100 llama.cpp Q4_K_M | 215（メガカーネルで 342） | — | paper-19 |
+
+MTP: vLLM は c=1 で 1.5〜1.6 倍、c=16 で 1.85〜2.3 倍。**llama-server では MoE に対して ≈0〜1.3 倍**（PR #23398 作者「MoE は高速化せず」、issue #27732 でも server はほぼ 0）。日本語長文（DGX Spark、NVFP4 Marlin）: 28.1 → 47.9 tok/s（1.71 倍、受理率 54.9%）、短い返答は −19%。
+
+### B.4 見積もり（この環境で切り替えた場合）【推定、±30%】
+| | 31B（現状の最適化後） | 26B-A4B PRO 6000 | 26B-A4B PRO 5000 48 GB |
+|---|---|---|---|
+| 単一ストリーム、投機なし | 55〜65 | llama.cpp Q4 170〜200／vLLM 140〜170 | 130〜170（起動律速なので帯域比 0.75 より落ちない） |
+| 単一ストリーム、MTP あり | 80〜125 | vLLM 230〜270（日本語は ×1.7 で約 230）／llama-server はほぼ不変 | vLLM 190〜230 |
+| 同時 8 合計（8K） | 290〜480 | vLLM FP8 約 670（実測）、NVFP4＋MTP 1,200〜1,500、llama.cpp 500〜900（`-np` の MoE スケーリングは未計測） | vLLM 500〜1,100 |
+| 同時 16 合計（8K） | 360〜650 | **vLLM NVFP4＋MTP 1,800〜2,240（実測）**、FP8 投機なし 約 1,000 | 1,300〜1,700 |
+| TTFT（2K ペルソナ、キャッシュミス） | 0.5 秒 | 0.2 秒（prefill 9,400 tok/s、FLOP は 31B の 1/8） | 0.35 秒 |
+| 16 × 32K の KV（f16） | 52.5 GiB（PRO 5000 では不可） | 13.1 GiB | 13.1 GiB（Q4 14.4 GB と合わせて余裕、FP8 28 GB でも fp8 KV なら可） |
+
+要約すると、同じカードで **単一 3 倍、多人数 3〜5 倍**。PRO 5000 48 GB でも 16 ユーザー × 32K が収まり、「並列数がメモリで決まる」制約が消える。vLLM の方が MTP とバッチングの利得を取り切れるので、26B-A4B にするなら vLLM 側の優位が 31B のときより大きい。
+
+### B.5 品質面の代償（切り替え判断の本体）
+- 公式ベンチ（26B／31B）: MMLU-Pro 82.6／85.2、GPQA Diamond 82.3／84.3、LiveCodeBench v6 77.1／80.0、IFEval 98.5／98.9、Tau2 68.2／76.9、**MRCR v2 128K 44.1／66.4（長文脈が最大の差）**。
+- 日本語: Swallow Leaderboard v2 の Ja 平均 0.646／0.675、Ja MT-Bench 0.806／0.815、JCommonsenseQA 96.4／97.9。
+- キャラクターチャットの報告（X・note、逸話レベル）: 26B-A4B は「人格の深みが表面的」「設定や関係性を取りこぼす」「一人称・二人称が入れ替わる」「長いシステムプロンプトで thinking を飛ばす」「突然キャラを崩して拒否する」。31B は長文脈でも人格を保つ。この用途では **31B との差が最も出やすい領域**。
+- 量子化感度が高い: LocalBench では Q8_0 でも KL 0.544（31B は 0.163）、KV q8_0 で KL 0.377、q4_0 KV で 1.088。Unsloth: QAT を素朴に Q4_0 化すると top-1 一致 70.2%（UD-Q4_K_XL は 85.6%）。vLLM 公式レシピは「エキスパートが小さく 4bit で品質が落ちすぎる」として 26B-A4B を W4A16 QAT の対象から外し、`int8_per_channel_weight_only` を勧める。→ **26B-A4B なら Q8_0／FP8／INT8 を選ぶのが筋**（単一ストリームは起動律速なので速度はほぼ変わらず、PRO 5000 でも容量は足りる）。KV は f16 のまま。
+- サンプラ: コミュニティ推奨は repetition penalty 無効（1.0）、Google 既定 temp 1.0／top-p 0.95／top-k 64。
+
+### B.6 運用メモ
+- vLLM: `vllm serve <FP8 または NVFP4 チェックポイント> --max-model-len 32768 --max-num-seqs 16 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --async-scheduling --limit-mm-per-prompt '{"image":0,"audio":0}' --speculative-config '{"model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}'`。TP=1、`--enable-expert-parallel` は不要。SM120 の MoE バックエンドは版で変わる（Marlin／CUTLASS／b12x、`--moe-backend` で指定、起動ログで確認。v0.21 → v0.23 で退行例あり）。
+- llama.cpp: `-ngl 99 -fa on`、全エキスパートが VRAM に載るので `--n-cpu-moe` 不要、`--swa-full` は避ける（32K スロットあたり 6.9 GiB）。CUDA グラフ再有効化（PR #26802、2026-08）で並列デコード +13%。MTP は server では効かないので投機は期待しない。
+- 現実的な進め方: 31B を主、26B-A4B を「キャラ単位の静的ルーティング」で併用（§8 案 15）。まず素の 26B-A4B-it を同じペルソナで 200 文脈に当て、人手ブラインドの勝率が 31B 比 40% 以上のキャラだけ切り替える。両モデル同時常駐は PRO 6000 なら余裕（14〜28 ＋ 18 GB）、PRO 5000 48 GB では 26B を Q4 にすれば可能（14.4 ＋ 17.7 ＋ KV）。
+
+### B.7 未確認
+llama-server の `-np` に対する MoE（MUL_MAT_ID）のスケーリング実測、PRO 5000 での実測、日本語ペルソナ対話での 26B 対 31B の統制比較、FP8 チェックポイントの実サイズ、独立ルーティング仮定（実際は偏るのでバイト数は少なめ）、vLLM 0.32 での MoE バックエンドの既定。
+
 ## 11. 主な参考 URL
 
 - Gemma 4 技術レポート: https://arxiv.org/abs/2607.02770 ／ vLLM 公式レシピ: https://docs.vllm.ai/projects/recipes/en/stable/Google/Gemma4.html ／ Google MTP ドラフタ: https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/
